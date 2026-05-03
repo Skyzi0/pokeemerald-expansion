@@ -1,3 +1,15 @@
+// item_menu.c
+// Gère l'intégralité du menu Sac : affichage des poches, navigation dans les listes
+// d'objets, menu contextuel (Utiliser/Jeter/Donner/Enregistrer…), tri, échange de
+// position d'objets, vente, dépôt en PC, et scénarios spéciaux (tutoriel Wally,
+// Demoiselle Faveur, Quiz Lady, Apprenti, Berry Blender…).
+//
+// Flux principal :
+//   GoToBagMenu() → CB2_Bag → SetupBagMenu() (machine à états en ~20 étapes)
+//   → Task_BagMenu_HandleInput() (boucle principale)
+//   → sContextMenuFuncs[location](taskId) selon le contexte d'ouverture
+//   → Task_FadeAndCloseBagMenu() → retour au callback d'origine.
+
 #include "global.h"
 #include "item_menu.h"
 #include "battle.h"
@@ -51,8 +63,14 @@
 #include "constants/rgb.h"
 #include "constants/songs.h"
 
+// Tags OAM pour les flèches de défilement : TAG_POCKET_SCROLL_ARROW pour la
+// liste d'objets (haut/bas), TAG_BAG_SCROLL_ARROW pour changer de poche (gauche/droite).
 #define TAG_POCKET_SCROLL_ARROW 110
 #define TAG_BAG_SCROLL_ARROW    111
+
+// ============================================================
+// CONSTANTES
+// ============================================================
 
 // The buffer for the bag item list needs to be large enough to hold the maximum
 // number of item slots that could fit in a single pocket, + 1 for Cancel.
@@ -67,12 +85,19 @@
 // Up to 8 item slots can be visible at a time
 #define MAX_ITEMS_SHOWN 8
 
+// ============================================================
+// ÉNUMÉRATIONS
+// ============================================================
+
+// Direction du changement de poche (L/R ou ←/→)
 enum {
     SWITCH_POCKET_NONE,
     SWITCH_POCKET_LEFT,
     SWITCH_POCKET_RIGHT
 };
 
+// Index des actions disponibles dans le menu contextuel d'un objet.
+// Chaque valeur correspond à une entrée de sItemMenuActions[].
 enum {
     ACTION_USE,
     ACTION_TOSS,
@@ -95,26 +120,38 @@ enum {
     ACTION_DUMMY,
 };
 
+// ID des fenêtres permanentes du sac (chargées au démarrage dans sDefaultBagWindows).
+// Les fenêtres contextuelles temporaires utilisent les ITEMWIN_* définis dans item_menu.h.
 enum {
-    WIN_ITEM_LIST,
-    WIN_DESCRIPTION,
-    WIN_POCKET_NAME,
-    WIN_TMHM_INFO_ICONS,
-    WIN_TMHM_INFO,
-    WIN_MESSAGE, // Identical to ITEMWIN_MESSAGE. Unused?
+    WIN_ITEM_LIST,        // Liste scrollable des objets de la poche courante
+    WIN_DESCRIPTION,      // Description de l'objet sélectionné (ou infos CT/CS)
+    WIN_POCKET_NAME,      // Nom de la poche affiché en haut à gauche
+    WIN_TMHM_INFO_ICONS,  // Icônes Type/Force/Précision/PP pour les CT/CS
+    WIN_TMHM_INFO,        // Valeurs numériques des stats CT/CS
+    WIN_MESSAGE,          // Boîte de message générique (duplique ITEMWIN_MESSAGE, non utilisée)
 };
 
-// Item list ID for toSwapPos to indicate an item is not currently being swapped
+// Valeur sentinelle dans gBagMenu->toSwapPos : aucun échange en cours.
 #define NOT_SWAPPING 0xFF
 
+// ============================================================
+// STRUCTURES LOCALES
+// ============================================================
+
+// Tampon pour les métadonnées de la liste (nom + id par slot).
 struct ListBuffer1 {
     struct ListMenuItem subBuffers[MAX_POCKET_ITEMS];
 };
 
+// Tampon pour les chaînes de noms d'objets affichées dans la liste
+// (inclut le préfixe numéroté pour les CT/CS et les Baies).
 struct ListBuffer2 {
     u8 name[MAX_POCKET_ITEMS][max(ITEM_NAME_LENGTH, MOVE_NAME_LENGTH) + 15];
 };
 
+// Sauvegarde temporaire du sac réel du joueur pendant le tutoriel Wally/Papi.
+// Le jeu vide le sac, le remplace par Potion+Poké Ball pour la démo, puis restaure
+// les données originales à la sortie via RestoreBagAfterWallyTutorial().
 struct TempWallyBag {
     struct ItemSlot bagPocket_Items[BAG_ITEMS_COUNT];
     struct ItemSlot bagPocket_PokeBalls[BAG_POKEBALLS_COUNT];
@@ -124,6 +161,9 @@ struct TempWallyBag {
     u16 pocket;
 };
 
+// ============================================================
+// PROTOTYPES STATIQUES
+// ============================================================
 static void CB2_Bag(void);
 static bool8 SetupBagMenu(void);
 static void BagMenu_InitBGs(void);
@@ -235,6 +275,14 @@ static s32 CompareItemsByMost(enum Pocket pocketId, struct ItemSlot item1, struc
 static s32 CompareItemsByType(enum Pocket pocketId, struct ItemSlot item1, struct ItemSlot item2);
 static s32 CompareItemsByIndex(enum Pocket pocketId, struct ItemSlot item1, struct ItemSlot item2);
 
+// ============================================================
+// DONNÉES STATIQUES — GRAPHISMES ET MISE EN PAGE
+// ============================================================
+
+// Configuration des 3 calques BG utilisés par le menu Sac :
+//   BG0 (prio 1) : fenêtres texte (liste, description, nom de poche)
+//   BG1 (prio 0) : fenêtres contextuelles (menus, messages) — au-dessus du reste
+//   BG2 (prio 2) : tilemap du décor graphique du sac (derrière le texte)
 static const struct BgTemplate sBgTemplates_ItemMenu[] =
 {
     {
@@ -266,6 +314,9 @@ static const struct BgTemplate sBgTemplates_ItemMenu[] =
     },
 };
 
+// Template de base pour la liste d'objets scrollable.
+// Les champs totalItems/items/maxShowed sont remplis dynamiquement dans
+// LoadBagItemListBuffers() avant chaque appel à ListMenuInit().
 static const struct ListMenuTemplate sItemListMenu =
 {
     .items = NULL,
@@ -288,6 +339,9 @@ static const struct ListMenuTemplate sItemListMenu =
     .cursorKind = CURSOR_BLACK_ARROW
 };
 
+// Table de toutes les actions possibles du menu contextuel.
+// Chaque entrée lie un texte affiché à la fonction appelée quand l'action est choisie.
+// Les constantes ACTION_* indexent directement ce tableau.
 static const u8 sText_NothingToSort[] = _("There's nothing to sort!");
 static const struct MenuAction sItemMenuActions[] = {
     [ACTION_USE]               = {gMenuText_Use,                {ItemMenu_UseOutOfBattle}},
@@ -311,8 +365,8 @@ static const struct MenuAction sItemMenuActions[] = {
     [ACTION_DUMMY]             = {gText_EmptyString2, {NULL}}
 };
 
-// these are all 2D arrays with a width of 2 but are represented as 1D arrays
-// ACTION_DUMMY is used to represent blank spaces
+// Listes d'actions par poche/contexte. Stockées à plat, lues comme grilles 2×N.
+// ACTION_DUMMY remplit les cases vides pour maintenir l'alignement de la grille.
 static const u8 sContextMenuItems_ItemsPocket[] = {
     ACTION_USE,         ACTION_GIVE,
     ACTION_TOSS,        ACTION_CANCEL
@@ -368,6 +422,8 @@ static const u8 sContextMenuItems_QuizLady[] = {
     ACTION_CONFIRM_QUIZ_LADY, ACTION_CANCEL
 };
 
+// Associe chaque ITEMMENULOCATION_* à la fonction de menu contextuel correspondante.
+// Appelé dans Task_BagMenu_HandleInput() quand le joueur appuie sur A sur un objet.
 static const TaskFunc sContextMenuFuncs[] = {
     [ITEMMENULOCATION_FIELD] =                  Task_ItemContext_Normal,
     [ITEMMENULOCATION_BATTLE] =                 Task_ItemContext_Normal,
@@ -388,6 +444,7 @@ static const struct YesNoFuncTable sYesNoTossFunctions = {ConfirmToss, CancelTos
 
 static const struct YesNoFuncTable sYesNoSellItemFunctions = {ConfirmSell, CancelSell};
 
+// Flèches ← → pour changer de poche (positionnées sur le graphisme du sac).
 static const struct ScrollArrowsTemplate sBagScrollArrowsTemplate = {
     .firstArrowType = SCROLL_ARROW_LEFT,
     .firstX = 28,
@@ -402,8 +459,10 @@ static const struct ScrollArrowsTemplate sBagScrollArrowsTemplate = {
     .palNum = 0,
 };
 
+// Icône "SELECT" affichée à droite du nom d'un objet-clé enregistré dans la liste.
 static const u8 sRegisteredSelect_Gfx[] = INCGFX_U8("graphics/bag/select_button.png", ".4bpp");
 
+// ID de couleur pour BagMenu_Print(). Indexent sFontColorTable[][3].
 enum {
     COLORID_NORMAL,
     COLORID_POCKET_NAME,
@@ -421,6 +480,8 @@ static const u8 sFontColorTable[][3] = {
     [COLORID_TMHM_INFO]   = {TEXT_COLOR_TRANSPARENT, TEXT_DYNAMIC_COLOR_5,  TEXT_DYNAMIC_COLOR_1}
 };
 
+// Fenêtres permanentes du sac initialisées une seule fois à l'ouverture.
+// Positionnées en tuiles sur la grille de l'écran (32×20 tuiles en mode 0).
 static const struct WindowTemplate sDefaultBagWindows[] =
 {
     [WIN_ITEM_LIST] = {
@@ -480,6 +541,8 @@ static const struct WindowTemplate sDefaultBagWindows[] =
     DUMMY_WIN_TEMPLATE,
 };
 
+// Fenêtres contextuelles créées/détruites à la volée (menu d'action, messages,
+// confirmations Oui/Non, quantité). Indexées par les constantes ITEMWIN_*.
 static const struct WindowTemplate sContextMenuWindowTemplates[] =
 {
     [ITEMWIN_1x1] = {
@@ -574,13 +637,24 @@ static const struct WindowTemplate sContextMenuWindowTemplates[] =
     },
 };
 
-EWRAM_DATA struct BagMenu *gBagMenu = 0;
-EWRAM_DATA struct BagPosition gBagPosition = {0};
-static EWRAM_DATA struct ListBuffer1 *sListBuffer1 = 0;
-static EWRAM_DATA struct ListBuffer2 *sListBuffer2 = 0;
-EWRAM_DATA u16 gSpecialVar_ItemId = 0;
-static EWRAM_DATA struct TempWallyBag *sTempWallyBag = 0;
+// ============================================================
+// VARIABLES GLOBALES EN EWRAM
+// ============================================================
+// Placées en EWRAM (RAM externe) pour économiser la IWRAM (plus rapide mais limitée).
 
+EWRAM_DATA struct BagMenu *gBagMenu = 0;           // État courant du menu (alloué dans GoToBagMenu)
+EWRAM_DATA struct BagPosition gBagPosition = {0};  // Position curseur/scroll persistante entre ouvertures
+static EWRAM_DATA struct ListBuffer1 *sListBuffer1 = 0; // Métadonnées (id, pointeur nom) pour ListMenu
+static EWRAM_DATA struct ListBuffer2 *sListBuffer2 = 0; // Chaînes de noms formatées pour chaque slot
+EWRAM_DATA u16 gSpecialVar_ItemId = 0;             // ID de l'objet sélectionné (partagé avec scripts)
+static EWRAM_DATA struct TempWallyBag *sTempWallyBag = 0; // Backup du sac pendant le tutoriel Wally
+
+// ============================================================
+// POINTS D'ENTRÉE PUBLICS
+// ============================================================
+
+// Remet le curseur et le scroll de toutes les poches à zéro et sélectionne POCKET_ITEMS.
+// Appelé à la nouvelle partie ou après un reset de sauvegarde.
 void ResetBagScrollPositions(void)
 {
     gBagPosition.pocket = POCKET_ITEMS;
@@ -588,11 +662,13 @@ void ResetBagScrollPositions(void)
     memset(gBagPosition.scrollPosition, 0, sizeof(gBagPosition.scrollPosition));
 }
 
+// Ouverture du sac depuis le menu Start sur la carte (toutes les poches accessibles).
 void CB2_BagMenuFromStartMenu(void)
 {
     GoToBagMenu(ITEMMENULOCATION_FIELD, POCKETS_COUNT, CB2_ReturnToFieldWithOpenMenu);
 }
 
+// Ouverture du sac depuis le combat. Redirige vers le sac spécial Pyramide si nécessaire.
 void CB2_BagMenuFromBattle(void)
 {
     if (CurrentBattlePyramidLocation() == PYRAMID_LOCATION_NONE)
@@ -648,6 +724,11 @@ void QuizLadyOpenBagMenu(void)
     gSpecialVar_Result = FALSE;
 }
 
+// Fonction centrale d'ouverture du sac.
+//   location    : contexte d'ouverture (ITEMMENULOCATION_*), détermine les actions disponibles.
+//   pocket      : poche à afficher en premier (POCKETS_COUNT = garder la dernière poche ouverte).
+//   exitCallback: callback à appeler à la fermeture du sac.
+// Alloue gBagMenu, initialise les champs, puis passe le contrôle à CB2_Bag.
 void GoToBagMenu(u8 location, u8 pocket, MainCallback exitCallback)
 {
     gBagMenu = AllocZeroed(sizeof(*gBagMenu));
@@ -678,6 +759,7 @@ void GoToBagMenu(u8 location, u8 pocket, MainCallback exitCallback)
     }
 }
 
+// Callback principal (hors VBlank) : met à jour tâches, sprites et palettes chaque frame.
 void CB2_BagMenuRun(void)
 {
     RunTasks();
@@ -687,6 +769,7 @@ void CB2_BagMenuRun(void)
     UpdatePaletteFade();
 }
 
+// Callback VBlank : transfère OAM, palettes et requêtes de copie sprite vers la VRAM.
 void VBlankCB_BagMenuRun(void)
 {
     LoadOam();
@@ -694,22 +777,30 @@ void VBlankCB_BagMenuRun(void)
     TransferPlttBuffer();
 }
 
-#define tListTaskId        data[0]
-#define tListPosition      data[1]
-#define tQuantity          data[2]
-#define tNeverRead         data[3]
-#define tItemCount         data[8]
-#define tMsgWindowId       data[10]
-#define tPocketSwitchDir   data[11]
-#define tPocketSwitchTimer data[12]
-#define tPocketSwitchState data[13]
+// Alias lisibles pour les slots data[] de la tâche principale du sac.
+// Ces macros évitent d'utiliser des indices magiques dans les fonctions Task_*.
+#define tListTaskId        data[0]   // ID de la tâche ListMenu pour la poche courante
+#define tListPosition      data[1]   // Index dans la liste de l'objet sélectionné
+#define tQuantity          data[2]   // Quantité totale de l'objet sélectionné
+#define tNeverRead         data[3]   // Non utilisé (initialisé à 0)
+#define tItemCount         data[8]   // Quantité choisie pour Jeter/Vendre/Déposer
+#define tMsgWindowId       data[10]  // ID fenêtre du message affiché
+#define tPocketSwitchDir   data[11]  // Direction du changement de poche en cours
+#define tPocketSwitchTimer data[12]  // Frame counter pour l'animation de changement de poche
+#define tPocketSwitchState data[13]  // État de la machine à états du changement de poche
 
+// Boucle de chargement : appelle SetupBagMenu() jusqu'à ce qu'il retourne TRUE.
+// Attend aussi que le lien câble soit prêt si une connexion est active.
 static void CB2_Bag(void)
 {
     while (MenuHelpers_ShouldWaitForLinkRecv() != TRUE && SetupBagMenu() != TRUE && MenuHelpers_IsLinkActive() != TRUE)
         {};
 }
 
+// Machine à états (~20 étapes) qui initialise tout le menu Sac avant de rendre la main.
+// Chaque appel avance d'une étape ; retourne TRUE quand l'initialisation est terminée.
+// Ordre : reset hardware → chargement graphismes → fenêtres texte → listes d'objets
+//         → tâche input → sprites → flèches → fondu d'entrée → passage en CB2_BagMenuRun.
 static bool8 SetupBagMenu(void)
 {
     u8 taskId;
@@ -821,6 +912,8 @@ static bool8 SetupBagMenu(void)
     return FALSE;
 }
 
+// Réinitialise les registres BG, vide le tilemapBuffer, configure les 3 calques
+// depuis sBgTemplates_ItemMenu, et active l'affichage OAM + BG 0/1/2.
 static void BagMenu_InitBGs(void)
 {
     ResetVramOamAndBgCntRegs();
@@ -837,6 +930,14 @@ static void BagMenu_InitBGs(void)
     SetGpuReg(REG_OFFSET_BLDCNT, 0);
 }
 
+// Charge les graphismes du sac en plusieurs étapes (une par appel) pour répartir
+// le coût sur plusieurs frames. Retourne TRUE quand tout est chargé.
+// Étape 0 : décompression tileset en VRAM (BG2).
+// Étape 1 : décompression tilemap après que le tampon temporaire soit libéré.
+// Étape 2 : palette fond (rose si joueur féminin, sinon couleurs masculin/Wally).
+// Étape 3 : spritesheet de l'image du sac (sprite animé).
+// Étape 4 : palette du sprite sac.
+// Étape finale : graphismes de la ligne d'échange d'objets (swap line).
 static bool8 LoadBagMenu_Graphics(void)
 {
     switch (gBagMenu->graphicsLoadState)
@@ -879,6 +980,9 @@ static bool8 LoadBagMenu_Graphics(void)
     return FALSE;
 }
 
+// Crée la tâche principale de gestion des inputs.
+// En mode Wally (tutoriel), utilise Task_WallyTutorialBagMenu (séquence automatique).
+// Sinon, utilise Task_BagMenu_HandleInput (contrôle joueur normal).
 static u8 CreateBagInputHandlerTask(u8 location)
 {
     u8 taskId;
@@ -889,12 +993,16 @@ static u8 CreateBagInputHandlerTask(u8 location)
     return taskId;
 }
 
+// Alloue les deux tampons pour la liste d'objets (métadonnées + noms).
 static void AllocateBagItemListBuffers(void)
 {
     sListBuffer1 = Alloc(sizeof(*sListBuffer1));
     sListBuffer2 = Alloc(sizeof(*sListBuffer2));
 }
 
+// Remplit sListBuffer1/sListBuffer2 avec les noms et IDs des objets de la poche pocketId,
+// puis met à jour gMultiuseListMenuTemplate pour le prochain appel à ListMenuInit().
+// Ajoute une entrée "Fermer le sac" à la fin (sauf si hideCloseBagText est activé).
 static void LoadBagItemListBuffers(u8 pocketId)
 {
     u16 i;
@@ -930,6 +1038,10 @@ static void LoadBagItemListBuffers(u8 pocketId)
     gMultiuseListMenuTemplate.maxShowed = gBagMenu->numShownItems[pocketId];
 }
 
+// Formate le nom d'un objet selon la poche courante :
+//   CT/CS  → "CT42 VOLAROC" (numéro sur 2 ou 3 chiffres selon la quantité de CTs)
+//   Baies  → "N°01 BAIE-CERIZ" (numéro d'ordre dans le Pokédex des baies)
+//   Autres → nom brut, tronqué si nécessaire pour tenir dans la fenêtre.
 static void GetItemNameFromPocket(u8 *dest, enum Item itemId)
 {
     u8 *end;
@@ -964,6 +1076,9 @@ static void GetItemNameFromPocket(u8 *dest, enum Item itemId)
     }
 }
 
+// Callback appelé par le système ListMenu à chaque déplacement du curseur.
+// Met à jour l'icône de l'objet affiché et la description en bas de l'écran.
+// Joue SE_SELECT sauf lors de l'initialisation (onInit == TRUE).
 static void BagMenu_MoveCursorCallback(s32 itemIndex, bool8 onInit, struct ListMenu *list)
 {
     if (onInit != TRUE)
@@ -984,6 +1099,11 @@ static void BagMenu_MoveCursorCallback(s32 itemIndex, bool8 onInit, struct ListM
     }
 }
 
+// Callback appelé par ListMenu pour dessiner les éléments supplémentaires de chaque ligne :
+//   - Quantité (×N) alignée à droite pour les objets stackables.
+//   - Icône SELECT pour les objets-clés enregistrés.
+//   - Icône CS pour distinguer les CS des CT.
+//   - Curseur grisé à la position d'origine pendant un échange d'objets.
 static void BagMenu_ItemPrintCallback(u8 windowId, u32 itemIndex, u8 y)
 {
     if (itemIndex != LIST_CANCEL)
@@ -1022,6 +1142,8 @@ static void BagMenu_ItemPrintCallback(u8 windowId, u32 itemIndex, u8 y)
     }
 }
 
+// Affiche la description de l'objet à l'index donné dans WIN_DESCRIPTION.
+// Si itemIndex == LIST_CANCEL, affiche "Retourner à [lieu]" à la place.
 static void PrintItemDescription(int itemIndex)
 {
     const u8 *str;
@@ -1254,6 +1376,16 @@ static void PrintItemSoldAmount(int windowId, int numSold, int moneyEarned)
     PrintMoneyAmount(windowId, CalculateMoneyTextHorizontalPosition(moneyEarned), 1, moneyEarned, 0);
 }
 
+// ============================================================
+// BOUCLE PRINCIPALE D'INPUT
+// ============================================================
+
+// Tâche principale : lit les entrées du joueur chaque frame.
+//   L/R ou ←/→  : change de poche (avec animation).
+//   SELECT       : démarre/valide un échange de position d'objets (si poche éligible).
+//   START        : ouvre le sous-menu de tri (≥2 objets requis).
+//   A sur objet  : appelle sContextMenuFuncs[location] → menu contextuel.
+//   A sur Cancel : ferme le sac.
 static void Task_BagMenu_HandleInput(u8 taskId)
 {
     s16 *data = gTasks[taskId].data;
@@ -1348,6 +1480,8 @@ static void Task_BagMenu_HandleInput(u8 taskId)
     }
 }
 
+// Recrée les flèches de navigation, restaure les fenêtres de description/poche,
+// et repasse la tâche à Task_BagMenu_HandleInput.
 static void ReturnToItemList(u8 taskId)
 {
     CreatePocketScrollArrowPair();
@@ -1388,6 +1522,12 @@ static void ChangeBagPocketId(u8 *bagPocketId, s8 deltaBagPocketId)
         *bagPocketId += deltaBagPocketId;
 }
 
+// Lance l'animation de changement de poche.
+//   deltaBagPocketId : +1 (droite) ou -1 (gauche).
+//   skipEraseList    : TRUE si on enchaîne un autre changement pendant l'animation
+//                      (évite de réinitialiser ce qui a déjà été effacé).
+// Efface la liste courante, prépare le nom de la nouvelle poche dans le tampon,
+// met à jour l'indicateur carré, et passe à Task_SwitchBagPocket.
 static void SwitchBagPocket(u8 taskId, s16 deltaBagPocketId, bool16 skipEraseList)
 {
     s16 *data = gTasks[taskId].data;
@@ -1427,6 +1567,9 @@ static void SwitchBagPocket(u8 taskId, s16 deltaBagPocketId, bool16 skipEraseLis
     SetTaskFuncWithFollowupFunc(taskId, Task_SwitchBagPocket, gTasks[taskId].func);
 }
 
+// Anime le changement de poche frame par frame (16 frames de transition).
+// À chaque frame paire, décale le nom de la poche d'une colonne dans la fenêtre.
+// Accepte également un nouvel input L/R pendant la transition pour chaîner les poches.
 static void Task_SwitchBagPocket(u8 taskId)
 {
     s16 *data = gTasks[taskId].data;
@@ -1505,6 +1648,12 @@ static bool8 CanSwapItems(void)
     return FALSE;
 }
 
+// ============================================================
+// ÉCHANGE DE POSITION D'OBJETS (SELECT)
+// ============================================================
+
+// Initialise l'échange : mémorise la position source, masque le curseur normal,
+// affiche "Déplacer [OBJET] où ?" et passe à Task_HandleSwappingItemsInput.
 static void StartItemSwap(u8 taskId)
 {
     s16 *data = gTasks[taskId].data;
@@ -1560,6 +1709,8 @@ static void Task_HandleSwappingItemsInput(u8 taskId)
     }
 }
 
+// Effectue l'échange en appelant MoveItemSlotInPocket(), puis reconstruit la liste.
+// Si la position de destination est la même (ou juste avant) que la source, annule.
 static void DoItemSwap(u8 taskId)
 {
     s16 *data = gTasks[taskId].data;
@@ -1604,6 +1755,14 @@ static void CancelItemSwap(u8 taskId)
     gTasks[taskId].func = Task_BagMenu_HandleInput;
 }
 
+// ============================================================
+// MENU CONTEXTUEL
+// ============================================================
+
+// Détermine les actions disponibles pour l'objet sélectionné selon le contexte
+// (location, poche, propriétés de l'objet : importance, utilisabilité au combat…),
+// puis affiche le menu contextuel dans une fenêtre de taille adaptée (1×1 à 2×3).
+// Pour les CT/CS : affiche les stats de la capacité dans WIN_TMHM_INFO.
 static void OpenContextMenu(u8 taskId)
 {
     switch (gBagPosition.location)
@@ -1862,6 +2021,13 @@ static void RemoveContextWindow(void)
         BagMenu_RemoveWindow(ITEMWIN_2x3);
 }
 
+// ============================================================
+// ACTIONS DU MENU CONTEXTUEL
+// ============================================================
+
+// ACTION_USE hors combat : vérifie qu'une fonction de terrain existe pour cet objet,
+// puis la déclenche. Si l'objet nécessite un Pokémon et qu'il n'y en a aucun,
+// affiche "Pas de Pokémon !". Les Baies utilisent toujours ItemUseOutOfBattle_Berry.
 static void ItemMenu_UseOutOfBattle(u8 taskId)
 {
     if (GetItemFieldFunc(gSpecialVar_ItemId))
@@ -1883,6 +2049,8 @@ static void ItemMenu_UseOutOfBattle(u8 taskId)
     }
 }
 
+// ACTION_TOSS : si quantité == 1, demande directement confirmation.
+// Sinon, affiche un sélecteur de quantité (Task_ChooseHowManyToToss).
 static void ItemMenu_Toss(u8 taskId)
 {
     s16 *data = gTasks[taskId].data;
@@ -1949,6 +2117,9 @@ static void Task_ChooseHowManyToToss(u8 taskId)
     }
 }
 
+// Affiche le message de confirmation du jet, puis attend A/B pour supprimer l'objet.
+// Dans la Pyramide Battle, utilise Task_RemoveItemFromBag (RemoveBagItem par ID)
+// au lieu de Task_TossItemFromBag (RemoveBagItemFromSlot par position).
 static void ConfirmToss(u8 taskId)
 {
     s16 *data = gTasks[taskId].data;
@@ -2007,6 +2178,9 @@ static void Task_RemoveItemFromBag(u8 taskId)
     }
 }
 
+// ACTION_REGISTER : bascule l'enregistrement de l'objet sur SELECT.
+// Si déjà enregistré → désenregistre (ITEM_NONE). Reconstruit la liste pour
+// mettre à jour l'icône SELECT affichée dans la liste.
 static void ItemMenu_Register(u8 taskId)
 {
     s16 *data = gTasks[taskId].data;
@@ -2024,6 +2198,8 @@ static void ItemMenu_Register(u8 taskId)
     ItemMenu_Cancel(taskId);
 }
 
+// ACTION_GIVE : vérifie que l'objet peut être tenu (pas courrier non rédigé,
+// pas objet important), puis ouvre le menu de sélection du Pokémon (CB2_ChooseMonToGiveItem).
 static void ItemMenu_Give(u8 taskId)
 {
     RemoveContextWindow();
@@ -2088,6 +2264,9 @@ static void ItemMenu_Cancel(u8 taskId)
     ReturnToItemList(taskId);
 }
 
+// ACTION_BATTLE_USE : redirige vers la fonction d'utilisation en combat appropriée
+// selon le type d'objet (BAG_MENU direct, PARTY_MENU, ou PARTY_MENU_MOVES pour
+// les CT/CS). En double combat, les objets de type BATTLER passent par PARTY_MENU.
 static void ItemMenu_UseInBattle(u8 taskId)
 {
     // Safety check
@@ -2144,6 +2323,9 @@ static void Task_ItemContext_GiveToPC(u8 taskId)
 
 #define tUsingRegisteredKeyItem data[3] // See usage in item_use.c
 
+// Déclenche l'utilisation de l'objet-clé enregistré sur SELECT depuis la carte.
+// Interdit dans l'Union Room, la Pyramide Battle, le Pike et les salles multijoueur.
+// Si l'objet n'est plus dans le sac, le désenregistre automatiquement.
 bool8 UseRegisteredKeyItemOnField(void)
 {
     u8 taskId;
@@ -2176,6 +2358,13 @@ bool8 UseRegisteredKeyItemOnField(void)
 
 #undef tUsingRegisteredKeyItem
 
+// ============================================================
+// VENTE (contexte SHOP)
+// ============================================================
+
+// Refuse la vente si l'objet est gratuit ou important (objet-clé).
+// Si quantité == 1, affiche directement le prix et demande confirmation.
+// Sinon, ouvre un sélecteur de quantité + prix mis à jour en temps réel.
 static void Task_ItemContext_Sell(u8 taskId)
 {
     s16 *data = gTasks[taskId].data;
@@ -2277,6 +2466,8 @@ static void ConfirmSell(u8 taskId)
     DisplayItemMessage(taskId, FONT_NORMAL, gStringVar4, SellItem);
 }
 
+// Effectue la vente : retire les objets du sac, crédite l'argent, met à jour
+// l'affichage du solde dans la fenêtre d'argent, puis attend A/B pour continuer.
 static void SellItem(u8 taskId)
 {
     s16 *data = gTasks[taskId].data;
@@ -2306,6 +2497,12 @@ static void WaitAfterItemSell(u8 taskId)
     }
 }
 
+// ============================================================
+// DÉPÔT EN PC (contexte ITEMPC)
+// ============================================================
+
+// Si quantité == 1, tente directement le dépôt.
+// Sinon ouvre un sélecteur de quantité (Task_ChooseHowManyToDeposit).
 static void Task_ItemContext_Deposit(u8 taskId)
 {
     s16 *data = gTasks[taskId].data;
@@ -2351,6 +2548,9 @@ static void Task_ChooseHowManyToDeposit(u8 taskId)
     }
 }
 
+// Tente d'ajouter les objets au PC (AddPCItem).
+// Affiche une erreur si objet important ou PC plein ; sinon supprime du sac via
+// Task_RemoveItemFromBag et attend A/B pour confirmer.
 static void TryDepositItem(u8 taskId)
 {
     s16 *data = gTasks[taskId].data;
@@ -2400,6 +2600,12 @@ static bool8 IsWallysBag(void)
     return FALSE;
 }
 
+// ============================================================
+// TUTORIEL WALLY / PAPI
+// ============================================================
+
+// Sauvegarde le vrai sac du joueur dans sTempWallyBag, vide les poches Items et
+// Poké Balls, remet les positions curseur/scroll à zéro pour la démo.
 static void PrepareBagForWallyTutorial(void)
 {
     u32 i;
@@ -2450,8 +2656,12 @@ void InitOldManBag(void)
 }
 
 #define tTimer data[8]
-#define WALLY_BAG_DELAY 102 // The number of frames between each action Wally takes in the bag
+#define WALLY_BAG_DELAY 102 // Frames entre chaque action de Wally (~1.7 secondes à 60fps)
 
+// Séquence automatique simulant Wally qui utilise le sac :
+//   Frame 102 : change de poche vers Poké Balls.
+//   Frame 204 : ouvre le menu contextuel sur la Poké Ball.
+//   Frame 306 : ferme le menu et referme le sac, puis restaure le vrai sac.
 static void Task_WallyTutorialBagMenu(u8 taskId)
 {
     s16 *data = gTasks[taskId].data;
@@ -2533,6 +2743,13 @@ static void CB2_QuizLadyExitBagMenu(void)
     SetMainCallback2(CB2_ReturnToField);
 }
 
+// ============================================================
+// UTILITAIRES D'AFFICHAGE
+// ============================================================
+
+// Pré-rend un ou deux noms de poche dans un tampon de tuiles (gBagMenu->pocketNameBuffer)
+// via une fenêtre temporaire. L'animation de changement de poche copie ensuite ce tampon
+// colonne par colonne avec CopyPocketNameToWindow() pour l'effet de glissement.
 static void PrintPocketNames(const u8 *pocketName1, const u8 *pocketName2)
 {
     struct WindowTemplate window = {0};
@@ -2554,6 +2771,9 @@ static void PrintPocketNames(const u8 *pocketName1, const u8 *pocketName2)
     RemoveWindow(windowId);
 }
 
+// Copie une tranche du tampon de noms de poche dans WIN_POCKET_NAME.
+// Le paramètre 'a' (0–8) est le décalage horizontal en tuiles : 0 = poche courante
+// centrée, 8 = poche suivante à droite. Utilisé pour animer le glissement.
 static void CopyPocketNameToWindow(u32 a)
 {
     u8 (*tileDataBuffer)[32][32];
@@ -2588,6 +2808,8 @@ static void LoadBagMenuTextWindows(void)
     ScheduleBgCopyTilemapToVram(1);
 }
 
+// Wrapper autour d'AddTextPrinterParameterized4 qui traduit colorIndex en triplet
+// (fond, texte, ombre) via sFontColorTable.
 static void BagMenu_Print(u8 windowId, u8 fontId, const u8 *str, u8 left, u8 top, u8 letterSpacing, u8 lineSpacing, u8 speed, u8 colorIndex)
 {
     AddTextPrinterParameterized4(windowId, fontId, left, top, letterSpacing, lineSpacing, sFontColorTable[colorIndex], speed, str);
@@ -2598,6 +2820,8 @@ static u8 UNUSED BagMenu_GetWindowId(u8 windowType)
     return gBagMenu->windowIds[windowType];
 }
 
+// Crée une fenêtre contextuelle (si elle n'existe pas déjà) et dessine son cadre.
+// Le slot windowIds[windowType] mémorise l'ID pour la fermer plus tard.
 static u8 BagMenu_AddWindow(u8 windowType)
 {
     u8 *windowId = &gBagMenu->windowIds[windowType];
@@ -2663,6 +2887,9 @@ static void RemoveMoneyWindow(void)
     RemoveMoneyLabelObject();
 }
 
+// Pré-dessine les icônes fixes (Type/Force/Précision/PP) dans WIN_TMHM_INFO_ICONS.
+// Appelé une seule fois à l'ouverture ; les valeurs numériques sont mises à jour
+// par PrintTMHMMoveData() à chaque changement de sélection.
 static void PrepareTMHMMoveWindow(void)
 {
     FillWindowPixelBuffer(WIN_TMHM_INFO_ICONS, PIXEL_FILL(0));
@@ -2673,6 +2900,8 @@ static void PrepareTMHMMoveWindow(void)
     CopyWindowToVram(WIN_TMHM_INFO_ICONS, COPYWIN_GFX);
 }
 
+// Affiche les stats de la capacité enseignée par la CT/CS sélectionnée :
+// icône de type, puis Force/Précision/PP (affiche "---" si la valeur est 0 ou ≤1).
 static void PrintTMHMMoveData(enum Item itemId)
 {
     u8 i;
@@ -2765,6 +2994,15 @@ static const u8 sBagMenuSortBerriesTMsHMs[] =
     ACTION_CANCEL,
 };
 
+// ============================================================
+// TRI DES OBJETS (START)
+// ============================================================
+
+// Affiche le sous-menu "Trier comment ?" avec les options disponibles selon la poche :
+//   Objets       : Nom / Type / Quantité / Annuler
+//   Objets-clés  : Nom / Annuler
+//   Poké Balls   : Nom / Quantité / Annuler
+//   CT/CS/Baies  : Nom / Quantité / Index / Annuler
 static void AddBagSortSubMenu(void)
 {
     switch (gBagPosition.pocket)
@@ -2842,6 +3080,8 @@ static void ItemMenu_SortByIndex(u8 taskId)
     gTasks[taskId].func = SortBagItems;
 }
 
+// Applique le tri choisi (MergeSort avec le comparateur correspondant),
+// reconstruit la liste et affiche "Objets triés par [critère] !".
 static void SortBagItems(u8 taskId)
 {
     s16 *data = gTasks[taskId].data;
@@ -2873,6 +3113,8 @@ static void Task_SortFinish(u8 taskId)
     }
 }
 
+// Dispatch vers le bon comparateur MergeSort selon le critère de tri.
+// Exposée publiquement pour être appelée aussi depuis UpdatePocketItemList().
 void SortItemsInBag(struct BagPocket *pocket, enum BagSortOptions type)
 {
     switch (type)
@@ -2892,6 +3134,12 @@ void SortItemsInBag(struct BagPocket *pocket, enum BagSortOptions type)
     }
 }
 
+// ============================================================
+// ALGORITHME DE TRI (Merge Sort bottom-up)
+// ============================================================
+
+// Fusionne deux sous-tableaux [iLeft, iRight[ et [iRight, iEnd[ dans dummySlots.
+// Inline forcé car appelé en boucle serrée depuis MergeSort.
 static inline __attribute__((always_inline)) void Merge(struct BagPocket *pocket, u32 iLeft, u32 iRight, u32 iEnd, struct ItemSlot *dummySlots, s32 (*comparator)(enum Pocket, struct ItemSlot, struct ItemSlot))
 {
     struct ItemSlot item_i, item_j;
@@ -2913,6 +3161,9 @@ static inline __attribute__((always_inline)) void Merge(struct BagPocket *pocket
     }
 }
 
+// Implémentation itérative (bottom-up) du tri fusion.
+// Alloue un tableau temporaire de la taille de la poche, trie uniquement les slots
+// non vides (s'arrête au premier itemId == ITEM_NONE), puis libère le tampon.
 // Source: https://en.wikipedia.org/wiki/Merge_sort#Bottom-up_implementation
 static void MergeSort(struct BagPocket *pocket, s32 (*comparator)(enum Pocket, struct ItemSlot, struct ItemSlot))
 {
@@ -2937,6 +3188,9 @@ static void MergeSort(struct BagPocket *pocket, s32 (*comparator)(enum Pocket, s
     Free(dummySlots);
 }
 
+// Compare deux objets alphabétiquement.
+// Pour les CT/CS, compare le nom de la capacité (pas le nom "CT42") pour un tri cohérent.
+// Les slots vides (ITEM_NONE) sont toujours renvoyés après les objets réels.
 static s32 CompareItemsAlphabetically(enum Pocket pocketId, struct ItemSlot item1, struct ItemSlot item2)
 {
     const u8 *name1, *name2;
@@ -2960,6 +3214,7 @@ static s32 CompareItemsAlphabetically(enum Pocket pocketId, struct ItemSlot item
     return StringCompare(name1, name2);
 }
 
+// Trie du plus grand stock au plus petit ; à quantité égale, tri alphabétique.
 static s32 CompareItemsByMost(enum Pocket pocketId, struct ItemSlot item1, struct ItemSlot item2)
 {
     if (item1.itemId == ITEM_NONE)
@@ -2975,6 +3230,8 @@ static s32 CompareItemsByMost(enum Pocket pocketId, struct ItemSlot item1, struc
     return CompareItemsAlphabetically(pocketId, item1, item2); // Items have same quantity so sort alphabetically
 }
 
+// Trie par ItemSortType (catégorie de l'objet) ; les objets non catégorisés vont en fin.
+// À type égal, tri alphabétique.
 static s32 CompareItemsByType(enum Pocket pocketId, struct ItemSlot item1, struct ItemSlot item2)
 {
     if (item1.itemId == ITEM_NONE)
@@ -2998,6 +3255,10 @@ static s32 CompareItemsByType(enum Pocket pocketId, struct ItemSlot item1, struc
     return CompareItemsAlphabetically(pocketId, item1, item2); // Items are of same type so sort alphabetically
 }
 
+// Trie CT/CS par numéro de CT/CS, et Baies par itemId (ordre du Pokédex des baies).
+// Retourne 0 pour les autres poches (pas d'index significatif).
+// Note : deux stacks du même objet indexé ne peuvent pas coexister, donc retour 0 final
+// est sans effet pratique.
 static s32 CompareItemsByIndex(enum Pocket pocketId, struct ItemSlot item1, struct ItemSlot item2)
 {
     u16 index1 = 0, index2 = 0;
